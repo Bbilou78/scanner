@@ -1,0 +1,551 @@
+//@version=6
+indicator("Second Wave Hunter v2.6", overlay=true, max_labels_count=100)
+
+//==================================================
+// 1. SETTINGS
+//==================================================
+
+minPump = input.float(25, "Minimum First Wave %", minval=10, step=5)
+minRetrace = input.float(30, "Minimum Correction %", minval=10)
+maxRetrace = input.float(70, "Maximum Correction %", minval=20)
+deepCorrectionLevel = input.float(60, "Deep Correction Level %", minval=40, maxval=70)
+
+pivotLen = input.int(4, "Pivot Length", minval=2)
+breakoutLen = input.int(10, "Breakout Lookback", minval=3)
+maxSetupBars = input.int(160, "Maximum Setup Bars", minval=20)
+
+vol15Multiplier = input.float(1.2, "15M Volume Multiplier", minval=1, step=0.1)
+vol4hMultiplier = input.float(1.3, "4H Volume Multiplier", minval=1, step=0.1)
+
+confirmationBars = input.int(3, "Breakout Confirmation Bars", minval=1)
+useEMA200 = input.bool(true, "Use EMA200 Confirmation")
+
+// Minimum first-wave duration: 4 bars = 1 hour on 15M
+const int minWaveBars = 4
+
+//==================================================
+// 2. TIMEFRAME
+//==================================================
+
+validChart = timeframe.isminutes and timeframe.multiplier == 15
+
+//==================================================
+// 3. INDICATORS
+//==================================================
+
+ema20 = ta.ema(close, 20)
+ema50 = ta.ema(close, 50)
+ema200 = ta.ema(close, 200)
+
+rsiValue = ta.rsi(close, 14)
+volumeAverage = ta.sma(volume, 20)
+
+vol15Ready = volume > volumeAverage * vol15Multiplier
+
+momentumCoreReady =
+     close > ema20 and
+     rsiValue >= 48
+
+emaTrendReady = not useEMA200 or close > ema200
+
+//==================================================
+// 4. HIGHER TIMEFRAME FILTERS
+//==================================================
+
+vol4h = request.security(
+     syminfo.tickerid, "240", volume[1],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on)
+
+vol4hAverage = request.security(
+     syminfo.tickerid, "240", ta.sma(volume, 20)[1],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on)
+
+vol4hReady = vol4h > vol4hAverage * vol4hMultiplier
+
+close1h = request.security(
+     syminfo.tickerid, "60", close[1],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on)
+
+ema50_1h = request.security(
+     syminfo.tickerid, "60", ta.ema(close, 50)[1],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on)
+
+trend1hReady = close1h > ema50_1h
+
+//==================================================
+// 5. REVERSAL CANDLES
+//==================================================
+
+bullishEngulfing =
+     close > open and
+     close[1] < open[1] and
+     close >= open[1] and
+     open <= close[1]
+
+bodySize = math.abs(close - open)
+lowerWick = math.min(open, close) - low
+upperWick = high - math.max(open, close)
+
+hammer =
+     close > open and
+     lowerWick >= bodySize * 2 and
+     upperWick <= bodySize
+
+piercing =
+     close[1] < open[1] and
+     close > open and
+     close > (open[1] + close[1]) / 2 and
+     open < close[1]
+
+reversalCandle = bullishEngulfing or hammer or piercing
+
+//==================================================
+// 6. PIVOTS
+//==================================================
+
+pivotLow = ta.pivotlow(low, pivotLen, pivotLen)
+pivotHigh = ta.pivothigh(high, pivotLen, pivotLen)
+
+// Store multiple confirmed Pivot Lows
+var float[] confirmedLowPrices = array.new_float()
+var int[] confirmedLowBars = array.new_int()
+
+var int lastUsedLowBar = na
+
+if not na(pivotLow)
+    array.push(confirmedLowPrices, pivotLow)
+    array.push(confirmedLowBars, bar_index - pivotLen)
+
+//==================================================
+// 7. FIRST WAVE DETECTION
+//==================================================
+
+var float waveLow = na
+var float waveHigh = na
+var float correctionLow = na
+
+var int waveStartBar = na
+var bool waveActive = false
+var bool waveInvalid = false
+var bool reversalSeen = false
+
+var bool earlyEntryFired = false
+var bool confirmedEntryFired = false
+
+var int breakoutBar = na
+
+// Last signal history
+var string lastSignalText = "NONE"
+var int lastSignalBar = na
+
+pivotHighBar = bar_index - pivotLen
+
+// Find latest valid confirmed low before Pivot High
+float selectedLow = na
+int selectedLowBar = na
+
+if not na(pivotHigh) and array.size(confirmedLowBars) > 0
+    for i = array.size(confirmedLowBars) - 1 to 0
+        candidateLow = array.get(confirmedLowPrices, i)
+        candidateBar = array.get(confirmedLowBars, i)
+
+        barsBetween = pivotHighBar - candidateBar
+
+        validLow =
+             barsBetween >= minWaveBars and
+             (na(lastUsedLowBar) or candidateBar > lastUsedLowBar) and
+             pivotHigh >= candidateLow * (1 + minPump / 100)
+
+        if validLow
+            selectedLow := candidateLow
+            selectedLowBar := candidateBar
+            break
+
+newWave =
+     not na(pivotHigh) and
+     not na(selectedLow) and
+     not na(selectedLowBar)
+
+lowestCorrection = ta.lowest(low, pivotLen + 1)
+
+if newWave
+    waveLow := selectedLow
+    waveHigh := pivotHigh
+    correctionLow := lowestCorrection
+
+    waveStartBar := pivotHighBar
+    waveActive := true
+    waveInvalid := false
+    reversalSeen := false
+
+    earlyEntryFired := false
+    confirmedEntryFired := false
+    breakoutBar := na
+
+    lastUsedLowBar := selectedLowBar
+
+//==================================================
+// 8. CORRECTION TRACKING
+//==================================================
+
+if waveActive and not na(waveStartBar)
+    if bar_index > waveStartBar
+        correctionLow := math.min(correctionLow, low)
+
+    waveInvalid := correctionLow <= waveLow
+
+waveRange = waveHigh - waveLow
+
+correctionPercent =
+     not na(waveRange) and waveRange > 0 ?
+     (waveHigh - correctionLow) / waveRange * 100 : na
+
+tooDeep =
+     waveActive and
+     not na(correctionPercent) and
+     correctionPercent > maxRetrace
+
+setupExpired =
+     waveActive and
+     not na(waveStartBar) and
+     bar_index - waveStartBar > maxSetupBars
+
+if setupExpired or waveInvalid or tooDeep
+    waveActive := false
+    breakoutBar := na
+    reversalSeen := false
+
+correctionReady =
+     waveActive and
+     not waveInvalid and
+     not tooDeep and
+     not na(correctionPercent) and
+     correctionPercent >= minRetrace and
+     correctionPercent <= maxRetrace
+
+deepCorrection =
+     correctionReady and
+     correctionPercent >= deepCorrectionLevel
+
+//==================================================
+// 9. REVERSAL CONFIRMATION
+//==================================================
+
+if waveActive and correctionReady and reversalCandle and barstate.isconfirmed
+    reversalSeen := true
+
+correctionConfirmationReady =
+     correctionReady and
+     (not deepCorrection or reversalSeen)
+
+//==================================================
+// 10. LOCAL BREAKOUT
+//==================================================
+
+localResistance = ta.highest(high, breakoutLen)[1]
+
+rawBreakout =
+     not na(localResistance) and
+     close > localResistance
+
+breakoutEvent =
+     validChart and
+     barstate.isconfirmed and
+     rawBreakout and
+     correctionConfirmationReady
+
+if breakoutEvent
+    breakoutBar := bar_index
+
+breakoutFresh =
+     waveActive and
+     correctionReady and
+     not na(breakoutBar) and
+     bar_index - breakoutBar <= confirmationBars
+
+//==================================================
+// 11. EARLY ENTRY
+//==================================================
+
+earlyCoreReady =
+     validChart and
+     barstate.isconfirmed and
+     breakoutFresh and
+     vol15Ready and
+     momentumCoreReady
+
+earlyEntry =
+     earlyCoreReady and
+     not earlyEntryFired
+
+//==================================================
+// 12. CONFIRMED ENTRY
+//==================================================
+
+confirmationScore =
+     (vol4hReady ? 1 : 0) +
+     (trend1hReady ? 1 : 0) +
+     (emaTrendReady ? 1 : 0)
+
+confirmedQualityReady = confirmationScore >= 2
+
+confirmedEntry =
+     earlyCoreReady and
+     confirmedQualityReady and
+     not confirmedEntryFired
+
+if earlyEntry
+    earlyEntryFired := true
+
+if confirmedEntry
+    confirmedEntryFired := true
+
+// Save the latest signal
+if confirmedEntry
+    lastSignalText := "CONFIRMED BUY"
+    lastSignalBar := bar_index
+else if earlyEntry
+    lastSignalText := "EARLY ENTRY"
+    lastSignalBar := bar_index
+
+//==================================================
+// 13. CHART SIGNALS
+//==================================================
+
+plot(ema20, "EMA 20", color=color.orange)
+plot(ema50, "EMA 50", color=color.blue)
+plot(ema200, "EMA 200", color=color.white)
+
+plotshape(
+     earlyEntry,
+     title="EARLY ENTRY",
+     text="EARLY",
+     style=shape.labelup,
+     location=location.belowbar,
+     color=color.orange,
+     textcolor=color.black,
+     size=size.small)
+
+plotshape(
+     confirmedEntry,
+     title="CONFIRMED ENTRY",
+     text="BUY",
+     style=shape.labelup,
+     location=location.belowbar,
+     color=color.lime,
+     textcolor=color.black,
+     size=size.small)
+
+//==================================================
+// 14. DIAGNOSTIC DASHBOARD
+//==================================================
+
+statusBg(string status) =>
+     status == "READY" or
+     status == "CONFIRMED" or
+     status == "FIRED" or
+     status == "DETECTED" or
+     status == "ABOVE" ?
+     color.new(color.green, 70) :
+     status == "BELOW" or
+     status == "INVALID" or
+     status == "USE 15 MIN" ?
+     color.new(color.red, 65) :
+     color.new(color.orange, 70)
+
+// Dashboard colors
+headerBg = color.rgb(25, 65, 110)
+labelBg = color.rgb(40, 45, 55)
+valueBg = color.rgb(25, 30, 38)
+
+// Dashboard: 18 rows
+var table dashboard = table.new(
+     position.top_left, 2, 18,
+     bgcolor=color.rgb(15, 18, 25),
+     frame_color=color.gray,
+     frame_width=1,
+     border_color=color.new(color.gray, 60),
+     border_width=1)
+
+// Status values
+chartText = validChart ? "15 MIN OK" : "USE 15 MIN"
+
+waveText = waveActive ? "DETECTED" : "WAIT"
+
+correctionText =
+     not waveActive ? "WAIT" :
+     tooDeep ? "TOO DEEP" :
+     not correctionReady ? "WAIT" :
+     deepCorrection and not reversalSeen ? "DEEP WAIT" :
+     deepCorrection ? "DEEP READY" :
+     "READY"
+
+reversalText =
+     waveActive and reversalSeen ? "CONFIRMED" : "WAIT"
+
+breakoutText =
+     waveActive and breakoutFresh ? "CONFIRMED" : "WAIT"
+
+// Show signal status only for the active setup
+earlyText =
+     not waveActive ? "WAIT" :
+     earlyEntryFired ? "FIRED" :
+     breakoutFresh ? "CHECKING" : "WAIT"
+
+confirmedText =
+     not waveActive ? "WAIT" :
+     confirmedEntryFired ? "FIRED" :
+     breakoutFresh and confirmedQualityReady ? "READY" : "WAIT"
+
+vol15Text = vol15Ready ? "READY" : "WAIT"
+vol4hText = vol4hReady ? "READY" : "WAIT"
+trendText = trend1hReady ? "READY" : "WAIT"
+momentumText = momentumCoreReady ? "READY" : "WAIT"
+emaText = emaTrendReady ? "ABOVE" : "BELOW"
+
+// Correction display only for active wave
+retraceText =
+     not waveActive or na(correctionPercent) ?
+     "N/A" :
+     str.tostring(correctionPercent, "#.0") + "%"
+
+// Last signal display
+lastSignalDisplay =
+     na(lastSignalBar) ? "NONE" :
+     lastSignalText + " / " +
+     str.tostring(bar_index - lastSignalBar) + " BARS AGO"
+
+// Diagnose current setup, not historical signals
+reasonText =
+     not validChart ? "USE 15 MIN CHART" :
+     not waveActive ? "NO ACTIVE WAVE" :
+     confirmedEntryFired ? "CONFIRMED SIGNAL FIRED" :
+     earlyEntryFired ? "EARLY SIGNAL FIRED" :
+     tooDeep ? "CORRECTION TOO DEEP" :
+     not correctionReady ? "WAITING FOR CORRECTION" :
+     deepCorrection and not reversalSeen ? "NEED REVERSAL" :
+     not breakoutFresh ? "WAITING FOR BREAKOUT" :
+     not vol15Ready ? "15M VOLUME TOO LOW" :
+     not momentumCoreReady ? "MOMENTUM NOT READY" :
+     not confirmedQualityReady ? "NEED 2 OF 3 FILTERS" :
+     "ENTRY CONDITIONS READY"
+
+// Draw dashboard
+if barstate.islast
+
+    table.cell(dashboard, 0, 0, "SWH v2.6",
+         bgcolor=headerBg, text_color=color.white,
+         text_size=size.small)
+
+    table.cell(dashboard, 1, 0, "STATUS",
+         bgcolor=headerBg, text_color=color.white,
+         text_size=size.small)
+
+    table.cell(dashboard, 0, 1, "Chart",
+         bgcolor=labelBg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 1, chartText,
+         bgcolor=statusBg(chartText), text_color=color.white, text_size=size.small)
+
+    table.cell(dashboard, 0, 2, "First Wave",
+         bgcolor=labelBg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 2, waveText,
+         bgcolor=statusBg(waveText), text_color=color.white, text_size=size.small)
+
+    table.cell(dashboard, 0, 3, "Correction",
+         bgcolor=labelBg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 3, correctionText,
+         bgcolor=statusBg(correctionText), text_color=color.white, text_size=size.small)
+
+    table.cell(dashboard, 0, 4, "Retrace %",
+         bgcolor=labelBg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 4, retraceText,
+         bgcolor=valueBg, text_color=color.white, text_size=size.small)
+
+    table.cell(dashboard, 0, 5, "Reversal",
+         bgcolor=labelBg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 5, reversalText,
+         bgcolor=statusBg(reversalText), text_color=color.white, text_size=size.small)
+
+    table.cell(dashboard, 0, 6, "Breakout",
+         bgcolor=labelBg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 6, breakoutText,
+         bgcolor=statusBg(breakoutText), text_color=color.white, text_size=size.small)
+
+    table.cell(dashboard, 0, 7, "15M Volume",
+         bgcolor=labelBg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 7, vol15Text,
+         bgcolor=statusBg(vol15Text), text_color=color.white, text_size=size.small)
+
+    table.cell(dashboard, 0, 8, "Momentum",
+         bgcolor=labelBg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 8, momentumText,
+         bgcolor=statusBg(momentumText), text_color=color.white, text_size=size.small)
+
+    table.cell(dashboard, 0, 9, "4H Volume",
+         bgcolor=labelBg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 9, vol4hText,
+         bgcolor=statusBg(vol4hText), text_color=color.white, text_size=size.small)
+
+    table.cell(dashboard, 0, 10, "1H Trend",
+         bgcolor=labelBg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 10, trendText,
+         bgcolor=statusBg(trendText), text_color=color.white, text_size=size.small)
+
+    table.cell(dashboard, 0, 11, "EMA200",
+         bgcolor=labelBg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 11, emaText,
+         bgcolor=statusBg(emaText), text_color=color.white, text_size=size.small)
+
+    table.cell(dashboard, 0, 12, "Confirm Score",
+         bgcolor=labelBg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 12,
+         str.tostring(confirmationScore) + " / 3",
+         bgcolor=valueBg, text_color=color.white, text_size=size.small)
+
+    table.cell(dashboard, 0, 13, "EARLY ENTRY",
+         bgcolor=color.new(color.orange, 55),
+         text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 13, earlyText,
+         bgcolor=statusBg(earlyText), text_color=color.white, text_size=size.small)
+
+    table.cell(dashboard, 0, 14, "CONFIRMED",
+         bgcolor=color.new(color.green, 55),
+         text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 14, confirmedText,
+         bgcolor=statusBg(confirmedText), text_color=color.white, text_size=size.small)
+
+    table.cell(dashboard, 0, 15, "Exchange",
+         bgcolor=labelBg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 15, syminfo.prefix,
+         bgcolor=valueBg, text_color=color.white, text_size=size.small)
+
+    // Last signal history
+    table.cell(dashboard, 0, 16, "LAST SIGNAL",
+         bgcolor=headerBg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 16, lastSignalDisplay,
+         bgcolor=valueBg, text_color=color.white, text_size=size.small)
+
+    // Current setup blocker
+    table.cell(dashboard, 0, 17, "WHY NO SIGNAL?",
+         bgcolor=headerBg, text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 17, reasonText,
+         bgcolor=color.new(color.orange, 55),
+         text_color=color.white, text_size=size.small)
+
+//==================================================
+// 15. ALERTS
+//==================================================
+
+alertcondition(
+     earlyEntry,
+     title="Second Wave EARLY ENTRY",
+     message="Second Wave Hunter v2.6: EARLY ENTRY")
+
+alertcondition(
+     confirmedEntry,
+     title="Second Wave CONFIRMED ENTRY",
+     message="Second Wave Hunter v2.6: CONFIRMED ENTRY")
