@@ -1,0 +1,30 @@
+# Secrets
+.env
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Logs and runtime
+*.log
+*.pid
+
+# Generated scan results
+SWH_scan_results.csv
+SWH_scan_errors.csv
+telegram_sent_alerts.json
+
+# Historical data and snapshots
+history/
+*.pkl
+
+# Temporary backups
+*.bak
+*.backup
+*.backup_*
+
+# Backup files
+*.bak*
+*_backup.py
+*_backup.*
